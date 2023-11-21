@@ -12,64 +12,158 @@ namespace blackview
 			public string Output { get; set; } = string.Empty;
 		}
 
+		static object Locker = new();
+
 		static void Main(string[] args)
 		{
-			Parser.Default.ParseArguments<Options>(args)
-			.WithParsed(o =>
+			while (true)
 			{
-				if (!string.IsNullOrEmpty(o.Hostname))
+				try
 				{
-					var suffixes = new[]
+					Parser.Default.ParseArguments<Options>(args)
+					.WithParsed(o =>
 					{
+						if (!string.IsNullOrEmpty(o.Hostname))
+						{
+							var suffixes = new[]
+							{
 						"F.mp4",
 						"R.mp4",
 						"F.thm",
 						"R.thm",
 						".gps",
 						".3gp",
-					};
+							};
 
-					Directory.CreateDirectory(o.Output);
+							Directory.CreateDirectory(o.Output);
 
-					var client = new HttpClient();
-					var tocURI = new Uri($"http://{o.Hostname}/blackvue_vod.cgi");
-					var videoTableOfContentsResponse = client.GetAsync(tocURI).Result;
-					if (videoTableOfContentsResponse.IsSuccessStatusCode)
-					{
-						var videoNames = new HashSet<string>();
-						var videoTableOfContentsStream = videoTableOfContentsResponse.Content.ReadAsStreamAsync().Result;
-						using var streamReader = new StreamReader(videoTableOfContentsStream);
-						string? line;
-						while ((line = streamReader.ReadLine()) != null)
-						{
-							var lineParts = line.Split(",");
-							if (lineParts.Length == 2)
+							var client = new HttpClient();
+							var tocURI = new Uri($"http://{o.Hostname}/blackvue_vod.cgi");
+							var tocResponse = client.GetAsync(tocURI).Result;
+							if (tocResponse.IsSuccessStatusCode)
 							{
-								string videoName = lineParts.First().Replace("n:/Record/", "").Replace("F.mp4", "").Replace("R.mp4", "");
-								videoNames.Add(videoName);
+								try
+								{
+									var rawFilenames = new HashSet<string>();
+									var tocStream = tocResponse.Content.ReadAsStreamAsync().Result;
+									using var streamReader = new StreamReader(tocStream);
+									string? line;
+									while ((line = streamReader.ReadLine()) != null)
+									{
+										var lineParts = line.Split(",");
+										if (lineParts.Length == 2)
+										{
+											string rawFilename = lineParts.First().Replace("n:/Record/", "").Replace("F.mp4", "").Replace("R.mp4", "");
+											rawFilenames.Add(rawFilename);
+										}
+									}
+
+									int numTotalFiles = suffixes.Length * rawFilenames.Count;
+									int numProcessedFiles = 0;
+									Parallel.ForEach(rawFilenames, new ParallelOptions
+									{
+										MaxDegreeOfParallelism = 1, 
+										// I've left the parallelization in here in case I want to support multiple cameras in the future.
+										// But reading from a single SD card is already a bottleneck that multiple threads wont help.
+									}, rawFilename =>
+									{
+										try
+										{
+											foreach (string suffix in suffixes)
+											{
+												var timeStarted = DateTime.Now;
+
+												int fileIndex;
+												lock (Locker)
+												{
+													++numProcessedFiles;
+													fileIndex = numProcessedFiles;
+												}
+
+												string filename = rawFilename + suffix;
+												string outputFilename = $"{o.Output}/{filename}";
+												var fileUri = new Uri($"http://{o.Hostname}/Record/{filename}");
+												string downloadStatus = $"{fileIndex}/{numTotalFiles} {fileUri}";
+												var headerRequest = new HttpRequestMessage(HttpMethod.Head, fileUri);
+												var headerResult = client.SendAsync(headerRequest).Result;
+												if (headerResult.IsSuccessStatusCode)
+												{
+													long fileSizeOnCamera = headerResult.Content.Headers.ContentLength ?? 0;
+													long fileSizeOnDisk = 0;
+
+													try
+													{
+														var fileInfo = new FileInfo(outputFilename);
+														fileSizeOnDisk = fileInfo.Length;
+													}
+													catch (FileNotFoundException) { }
+
+													if (fileSizeOnDisk != fileSizeOnCamera)
+													{
+														float MB = fileSizeOnCamera / 1024f / 1024f;
+														string size = $"{MB:F2} {nameof(MB)}";
+														string operation = fileSizeOnDisk == 0 ? "Downloading" : "Redownloading";
+
+														var downloadTask = client.GetAsync(fileUri);
+
+														var timeOfLastStatusUpdate = DateTime.MinValue;
+
+														while(!downloadTask.IsCompleted)
+														{
+															var timeNow = DateTime.Now;
+															var currentDuration = timeNow - timeStarted;
+															if (timeNow - timeOfLastStatusUpdate > TimeSpan.FromSeconds(30))
+															{
+																Console.WriteLine($"{downloadStatus} {operation} {size} for {currentDuration:mm\\:ss}");
+																timeOfLastStatusUpdate = DateTime.Now;
+															}
+
+															Thread.Sleep(1000);
+														}
+
+														var downloadResult = downloadTask.Result;
+														downloadResult.EnsureSuccessStatusCode();
+														using var fs = new FileStream(outputFilename, FileMode.Create);
+														downloadResult.Content.CopyToAsync(fs).Wait();
+														var totalDuration = DateTime.Now - timeStarted;
+														string speed = $"{MB / totalDuration.TotalSeconds:F2} MB/s";
+														Console.WriteLine($"{downloadStatus} Completed {size} in {totalDuration:mm\\:ss} @ {speed}");
+													}
+													else
+													{
+														Console.WriteLine($"{downloadStatus} Skipping");
+													}
+												}
+												else
+												{
+													Console.WriteLine($"{downloadStatus} Failed {headerResult.StatusCode}");
+												}
+											}
+										}
+										catch (Exception ex)
+										{
+											// Mostly catching task cancellations here. I'll replace with the correct exception later once I figure out what it is.
+											Console.WriteLine(ex.Message);
+										}
+									});
+								}
+								catch (Exception ex)
+								{
+									Console.WriteLine(ex.Message);
+								}
 							}
 						}
-
-						int numTotalDownloads = suffixes.Length * videoNames.Count;
-						int numCompletedDownloads = 0;
-						foreach (var videoName in videoNames)
-						{
-							foreach (var suffix in suffixes)
-							{
-								string downloadStatus = $"{numCompletedDownloads+1}/{numTotalDownloads}";
-								var filename = videoName + suffix;
-								var videoAddress = $"http://{o.Hostname}/Record/{filename}";
-								var videoURI = new Uri(videoAddress);
-								Console.WriteLine($"{downloadStatus} {videoAddress}");
-								var result = client.GetAsync(videoURI).Result;
-								using var fs = new FileStream($"{o.Output}/{filename}", FileMode.Create);
-								result.Content.CopyToAsync(fs).Wait();
-								++numCompletedDownloads;
-							}
-						}
-					}
+					});
 				}
-			});
+				catch(Exception ex) 
+				{
+					// Catching if the camera is offline. I'll replace with the correct exception later once I figure out what it is.
+					Console.WriteLine(ex.Message);
+				}
+
+				// Retry in 10 seconds.
+				Thread.Sleep(10000);
+			}
 		}
 	}
 }
