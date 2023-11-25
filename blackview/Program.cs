@@ -60,7 +60,7 @@ namespace blackview
 
 									int numTotalFiles = suffixes.Length * rawFilenames.Count;
 									int numProcessedFiles = 0;
-									Parallel.ForEach(rawFilenames, new ParallelOptions
+									Parallel.ForEach(rawFilenames.ToList().OrderByDescending(s => s), new ParallelOptions
 									{
 										MaxDegreeOfParallelism = 1, 
 										// I've left the parallelization in here in case I want to support multiple cameras in the future.
